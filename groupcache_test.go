@@ -65,7 +65,7 @@ func testSetup() {
 		}
 		cacheFills.Add(1)
 		return dest.SetString("ECHO:"+key, time.Time{})
-	}))
+	}), NewLRUStorage)
 
 	protoGroup = NewGroup(protoGroupName, cacheSize, GetterFunc(func(_ context.Context, key string, dest Sink) error {
 		if key == fromChan {
@@ -76,12 +76,12 @@ func testSetup() {
 			Name: proto.String("ECHO:" + key),
 			City: proto.String("SOME-CITY"),
 		}, time.Time{})
-	}))
+	}), NewLRUStorage)
 
 	expireGroup = NewGroup(expireGroupName, cacheSize, GetterFunc(func(_ context.Context, key string, dest Sink) error {
 		cacheFills.Add(1)
 		return dest.SetString("ECHO:"+key, time.Now().Add(time.Millisecond*100))
-	}))
+	}), NewLRUStorage)
 }
 
 // tests that a Getter's Get method is only called once with two
@@ -226,7 +226,7 @@ func TestCacheEviction(t *testing.T) {
 	}
 
 	g := stringGroup.(*Group)
-	evict0 := g.mainCache.nevict
+	evict0 := g.mainCache.Stats().Evictions
 
 	// Trash the cache with other keys.
 	var bytesFlooded int64
@@ -237,7 +237,7 @@ func TestCacheEviction(t *testing.T) {
 		stringGroup.Get(dummyCtx, key, StringSink(&res))
 		bytesFlooded += int64(len(key) + len(res))
 	}
-	evicts := g.mainCache.nevict - evict0
+	evicts := g.mainCache.Stats().Evictions - evict0
 	if evicts <= 0 {
 		t.Errorf("evicts = %v; want more than 0", evicts)
 	}
@@ -310,7 +310,8 @@ func TestPeers(t *testing.T) {
 		localHits++
 		return dest.SetString("got:"+key, time.Time{})
 	}
-	testGroup := newGroup("TestPeers-group", cacheSize, GetterFunc(getter), peerList)
+	storeFn := NewLRUStorage
+	testGroup := newGroup("TestPeers-group", cacheSize, GetterFunc(getter), peerList, storeFn)
 	run := func(name string, n int, wantSummary string) {
 		// Reset counters
 		localHits = 0
@@ -341,8 +342,8 @@ func TestPeers(t *testing.T) {
 	resetCacheSize := func(maxBytes int64) {
 		g := testGroup
 		g.cacheBytes = maxBytes
-		g.mainCache = cache{}
-		g.hotCache = cache{}
+		g.mainCache = storeFn()
+		g.hotCache = storeFn()
 	}
 
 	// Base case; peers all up, with no problems.
@@ -440,7 +441,7 @@ func TestNoDedup(t *testing.T) {
 	const testval = "testval"
 	g := newGroup("testgroup", 1024, GetterFunc(func(_ context.Context, key string, dest Sink) error {
 		return dest.SetString(testval, time.Time{})
-	}), nil)
+	}), nil, NewLRUStorage)
 
 	orderedGroup := &orderedFlightGroup{
 		stage1: make(chan bool),
@@ -482,16 +483,16 @@ func TestNoDedup(t *testing.T) {
 	}
 
 	const wantItems = 1
-	if g.mainCache.items() != wantItems {
-		t.Errorf("mainCache has %d items, want %d", g.mainCache.items(), wantItems)
+	if g.mainCache.Stats().Items != wantItems {
+		t.Errorf("mainCache has %d items, want %d", g.mainCache.Stats().Items, wantItems)
 	}
 
 	// If the singleflight callback doesn't double-check the cache again
 	// upon entry, we would increment nbytes twice but the entry would
 	// only be in the cache once.
 	const wantBytes = int64(len(testkey) + len(testval))
-	if g.mainCache.nbytes != wantBytes {
-		t.Errorf("cache has %d bytes, want %d", g.mainCache.nbytes, wantBytes)
+	if g.mainCache.Stats().Bytes != wantBytes {
+		t.Errorf("cache has %d bytes, want %d", g.mainCache.Stats().Bytes, wantBytes)
 	}
 }
 
@@ -522,7 +523,7 @@ func TestContextDeadlineOnPeer(t *testing.T) {
 	getter := func(_ context.Context, key string, dest Sink) error {
 		return dest.SetString("got:"+key, time.Time{})
 	}
-	testGroup := newGroup("TestContextDeadlineOnPeer-group", cacheSize, GetterFunc(getter), peerList)
+	testGroup := newGroup("TestContextDeadlineOnPeer-group", cacheSize, GetterFunc(getter), peerList, NewLRUStorage)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*300)
 	defer cancel()

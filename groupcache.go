@@ -94,8 +94,8 @@ func GetGroup(name string) *Group {
 // completes.
 //
 // The group name must be unique for each getter.
-func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
-	return newGroup(name, cacheBytes, getter, nil)
+func NewGroup(name string, cacheBytes int64, getter Getter, storeFn func() storage) *Group {
+	return newGroup(name, cacheBytes, getter, nil, storeFn)
 }
 
 // DeregisterGroup removes group from group pool
@@ -106,7 +106,7 @@ func DeregisterGroup(name string) {
 }
 
 // If peers is nil, the peerPicker is called via a sync.Once to initialize it.
-func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker) *Group {
+func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker, storeFn func() storage) *Group {
 	if getter == nil {
 		panic("nil Getter")
 	}
@@ -124,6 +124,9 @@ func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker) *G
 		loadGroup:   &singleflight.Group{},
 		setGroup:    &singleflight.Group{},
 		removeGroup: &singleflight.Group{},
+
+		mainCache: storeFn(),
+		hotCache:  storeFn(),
 	}
 	if fn := newGroupHook; fn != nil {
 		fn(g)
@@ -172,7 +175,7 @@ type Group struct {
 	// (amongst its peers) is authoritative. That is, this cache
 	// contains keys which consistent hash on to this process's
 	// peer number.
-	mainCache cache
+	mainCache storage
 
 	// hotCache contains keys/values for which this peer is not
 	// authoritative (otherwise they would be in mainCache), but
@@ -182,7 +185,7 @@ type Group struct {
 	// network card could become the bottleneck on a popular key.
 	// This cache is used sparingly to maximize the total number
 	// of key/value pairs that can be stored globally.
-	hotCache cache
+	hotCache storage
 
 	// loadGroup ensures that each key is only fetched once
 	// (either locally or remotely), regardless of the number of
@@ -281,12 +284,12 @@ func (g *Group) Set(ctx context.Context, key string, value []byte, expire time.T
 			// TODO(thrawn01): Not sure if this is useful outside of tests...
 			//  maybe we should ALWAYS update the local cache?
 			if hotCache {
-				g.localSet(key, value, expire, &g.hotCache)
+				g.localSet(key, value, expire, g.hotCache)
 			}
 			return nil, nil
 		}
 		// We own this key
-		g.localSet(key, value, expire, &g.mainCache)
+		g.localSet(key, value, expire, g.mainCache)
 		return nil, nil
 	})
 	return err
@@ -425,7 +428,7 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		}
 		g.Stats.LocalLoads.Add(1)
 		destPopulated = true // only one caller of load gets this return value
-		g.populateCache(key, value, &g.mainCache)
+		g.populateCache(key, value, g.mainCache)
 		return value, nil
 	})
 	if err == nil {
@@ -464,7 +467,7 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 	value := ByteView{b: res.Value, e: expire}
 
 	// Always populate the hot cache
-	g.populateCache(key, value, &g.hotCache)
+	g.populateCache(key, value, g.hotCache)
 	return value, nil
 }
 
@@ -494,15 +497,15 @@ func (g *Group) lookupCache(key string) (value ByteView, ok bool) {
 	if g.cacheBytes <= 0 {
 		return
 	}
-	value, ok = g.mainCache.get(key)
+	value, ok = g.mainCache.Get(key)
 	if ok {
 		return
 	}
-	value, ok = g.hotCache.get(key)
+	value, ok = g.hotCache.Get(key)
 	return
 }
 
-func (g *Group) localSet(key string, value []byte, expire time.Time, cache *cache) {
+func (g *Group) localSet(key string, value []byte, expire time.Time, cache storage) {
 	if g.cacheBytes <= 0 {
 		return
 	}
@@ -526,21 +529,21 @@ func (g *Group) localRemove(key string) {
 
 	// Ensure no requests are in flight
 	g.loadGroup.Lock(func() {
-		g.hotCache.remove(key)
-		g.mainCache.remove(key)
+		g.hotCache.Del(key)
+		g.mainCache.Del(key)
 	})
 }
 
-func (g *Group) populateCache(key string, value ByteView, cache *cache) {
+func (g *Group) populateCache(key string, value ByteView, cache storage) {
 	if g.cacheBytes <= 0 {
 		return
 	}
-	cache.add(key, value)
+	cache.Set(key, value)
 
 	// Evict items from cache(s) if necessary.
 	for {
-		mainBytes := g.mainCache.bytes()
-		hotBytes := g.hotCache.bytes()
+		mainBytes := g.mainCache.Stats().Bytes
+		hotBytes := g.hotCache.Stats().Bytes
 		if mainBytes+hotBytes <= g.cacheBytes {
 			return
 		}
@@ -548,11 +551,11 @@ func (g *Group) populateCache(key string, value ByteView, cache *cache) {
 		// TODO(bradfitz): this is good-enough-for-now logic.
 		// It should be something based on measurements and/or
 		// respecting the costs of different resources.
-		victim := &g.mainCache
+		victim := g.mainCache
 		if hotBytes > mainBytes/8 {
-			victim = &g.hotCache
+			victim = g.hotCache
 		}
-		victim.removeOldest()
+		victim.Evict()
 	}
 }
 
@@ -574,9 +577,9 @@ const (
 func (g *Group) CacheStats(which CacheType) CacheStats {
 	switch which {
 	case MainCache:
-		return g.mainCache.stats()
+		return g.mainCache.Stats()
 	case HotCache:
-		return g.hotCache.stats()
+		return g.hotCache.Stats()
 	default:
 		return CacheStats{}
 	}
@@ -586,90 +589,110 @@ func (g *Group) CacheStats(which CacheType) CacheStats {
 // makes values always be ByteView, and counts the size of all keys and
 // values.
 type cache struct {
-	mu         sync.RWMutex
-	nbytes     int64 // of all keys and values
+	mu  sync.RWMutex
+	lru *lru.Cache
+}
+
+type storage interface {
+	Set(key string, value ByteView)
+	Get(key string) (ByteView, bool)
+	Del(key string)
+	Evict()
+	Stats() CacheStats
+}
+
+type lruStorage struct {
+	sync.RWMutex
+
 	lru        *lru.Cache
-	nhit, nget int64
+	nbytes     int64 // of all keys and values
 	nevict     int64 // number of evictions
+	nhit, nget int64
 }
 
-func (c *cache) stats() CacheStats {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return CacheStats{
-		Bytes:     c.nbytes,
-		Items:     c.itemsLocked(),
-		Gets:      c.nget,
-		Hits:      c.nhit,
-		Evictions: c.nevict,
-	}
+func NewLRUStorage() storage {
+	return &lruStorage{}
 }
 
-func (c *cache) add(key string, value ByteView) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lru == nil {
-		c.lru = &lru.Cache{
+func (l *lruStorage) Set(key string, value ByteView) {
+	l.Lock()
+	defer l.Unlock()
+
+	if l.lru == nil {
+		l.lru = &lru.Cache{
 			OnEvicted: func(key lru.Key, value interface{}) {
 				val := value.(ByteView)
-				c.nbytes -= int64(len(key.(string))) + int64(val.Len())
-				c.nevict++
+				l.nbytes -= int64(len(key.(string))) + int64(val.Len())
+				l.nevict++
 			},
 		}
 	}
-	c.lru.Add(key, value, value.Expire())
-	c.nbytes += int64(len(key)) + int64(value.Len())
+
+	l.lru.Add(key, value, value.Expire())
+	l.nbytes += int64(len(key)) + int64(value.Len())
 }
 
-func (c *cache) get(key string) (value ByteView, ok bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.nget++
-	if c.lru == nil {
+func (l *lruStorage) Get(key string) (value ByteView, ok bool) {
+	l.Lock()
+	defer l.Unlock()
+	l.nget++
+	if l.lru == nil {
 		return
 	}
-	vi, ok := c.lru.Get(key)
+	vi, ok := l.lru.Get(key)
 	if !ok {
 		return
 	}
-	c.nhit++
+	l.nhit++
 	return vi.(ByteView), true
 }
 
-func (c *cache) remove(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lru == nil {
+func (l *lruStorage) Del(key string) {
+	l.Lock()
+	defer l.Unlock()
+	if l.lru == nil {
 		return
 	}
-	c.lru.Remove(key)
+	l.lru.Remove(key)
 }
 
-func (c *cache) removeOldest() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lru != nil {
-		c.lru.RemoveOldest()
+func (l *lruStorage) Stats() CacheStats {
+	l.RLock()
+	defer l.RUnlock()
+	return CacheStats{
+		Bytes:     l.nbytes,
+		Items:     l.itemsLocked(),
+		Gets:      l.nget,
+		Hits:      l.nhit,
+		Evictions: l.nevict,
 	}
 }
 
-func (c *cache) bytes() int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.nbytes
+func (l *lruStorage) Evict() {
+	l.Lock()
+	defer l.Unlock()
+	if l.lru != nil {
+		l.lru.RemoveOldest()
+	}
 }
 
-func (c *cache) items() int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.itemsLocked()
+func (l *lruStorage) bytes() int64 {
+	l.RLock()
+	defer l.RUnlock()
+	return l.nbytes
 }
 
-func (c *cache) itemsLocked() int64 {
-	if c.lru == nil {
+func (l *lruStorage) items() int64 {
+	l.RLock()
+	defer l.RUnlock()
+	return l.itemsLocked()
+}
+
+func (l *lruStorage) itemsLocked() int64 {
+	if l.lru == nil {
 		return 0
 	}
-	return int64(c.lru.Len())
+	return int64(l.lru.Len())
 }
 
 // An AtomicInt is an int64 to be accessed atomically.

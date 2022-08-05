@@ -54,7 +54,7 @@ func ExampleUsage() {
 			}
 			return nil
 		},
-	))
+	), groupcache.NewLRUStorage)
 
 	var user User
 
